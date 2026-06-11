@@ -1,3 +1,0 @@
-Value:Value
-source
-Comment://convert excel date to datetime   http://www.dotnetperls.com/fromoadate

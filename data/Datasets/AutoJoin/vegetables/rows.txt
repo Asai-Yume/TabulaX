@@ -1,2 +1,0 @@
-Vegetable:Vegetable - Type
-target

@@ -1,3 +1,0 @@
-Value:Value
-source
-Comment://convert cm to feet and inches  http://www.thecalculatorsite.com/conversions/common/cm-to-feet-inches.php

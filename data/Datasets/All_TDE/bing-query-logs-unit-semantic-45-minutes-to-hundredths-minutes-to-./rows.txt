@@ -1,3 +1,0 @@
-Value:Value
-source
-Comment://convert minutes to hundredths http://www.postalemployeenetwork.com/time-conversion-print.htm

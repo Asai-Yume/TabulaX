@@ -1,3 +1,0 @@
-Value:Value
-source
-Comment://convert rgb to cmyk  http://www.rapidtables.com/convert/color/rgb-to-cmyk.htm

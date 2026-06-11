@@ -1,3 +1,0 @@
-Value:Value
-source
-Comment://convert time to decimal  http://calendar.google.com/

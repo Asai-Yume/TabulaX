@@ -1,2 +1,0 @@
-FRUITS (raw):FRUIT CARB CHART
-target

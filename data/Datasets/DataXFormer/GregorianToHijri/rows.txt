@@ -1,2 +1,0 @@
-Gregorian:Hijri
-source

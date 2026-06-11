@@ -1,3 +1,0 @@
-Value:Value
-source
-Comment://convert ounces to cups https://www.google.com/search?q=v&ie=utf-8&oe=utf-8#q=convert+ounces+to+cups

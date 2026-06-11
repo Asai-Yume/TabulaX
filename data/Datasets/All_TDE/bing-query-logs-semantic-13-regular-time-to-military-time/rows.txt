@@ -1,3 +1,0 @@
-Value:Value
-source
-Comment://convert regular time to military time  http://www.calculatehours.com/Military_Time_Converter.html

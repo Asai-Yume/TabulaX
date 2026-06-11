@@ -1,3 +1,0 @@
-Value:Value
-source
-Comment://kgs to pounds, one digit after the decimal, rounding

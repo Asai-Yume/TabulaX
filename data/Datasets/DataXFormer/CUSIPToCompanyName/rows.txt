@@ -1,2 +1,0 @@
-CUSIP:Company name
-source

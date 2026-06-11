@@ -1,3 +1,0 @@
-Value:Value
-source
-Comment://Chemistry: Parsing a chemical formula

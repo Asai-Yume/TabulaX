@@ -1,3 +1,0 @@
-Value:Value
-source
-Comment://convert decimal degrees to degrees minutes seconds  https://www.fcc.gov/encyclopedia/degrees-minutes-seconds-tofrom-decimal-degrees

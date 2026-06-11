@@ -1,3 +1,0 @@
-Value:Value
-source
-Comment://Get MIME type from filename extension
