@@ -26,29 +26,36 @@ transformers.general.USE_TQDM = True
 transformers.basic.USE_TQDM = True
 
 import preprocessors
+from llm_logging import configure_llm_logging, flush_llm_summary, set_llm_context
 
 BASE_PATH = pathlib.Path(__file__).absolute().parent.parent.parent.absolute()
 ED_CACHE_PATH = BASE_PATH / "cache/edit_distance/ed.pkl"
 
 # Deepseek only supports general and basic types.
-MODEL_NAME = "gpt-4o-2024-05-13"  # ["gpt-4o-2024-05-13", "gpt-4o-mini-2024-07-18", "llama3.1-8b", "deepseek-chat"]
+# MODEL_NAME = "gpt-4o-2024-05-13"  # ["gpt-4o-2024-05-13", "gpt-4o-mini-2024-07-18", "llama3.1-8b", "deepseek-chat"]
+# PROMPT_VERSION = "v001"
+# BASIC_PROMPT = False  # Ignore framework and directly prompt the LLM
+
+
+# EXAMPLE_SIZE = 5
+# EXAMPLE_SIZE_TYPE = "fixed"
+# MATCHING_TYPE = 'edit_dist'  # ["exact", "edit_dist"]
+# CLASSIFICATION_TYPE = 'golden'  # ['golden', gpt_classifier', 'all_string']
+
+MODEL_NAME = "gpt-4o-mini-2024-07-18"
 PROMPT_VERSION = "v001"
-BASIC_PROMPT = False  # Ignore framework and directly prompt the LLM
+BASIC_PROMPT = False
 
-
-EXAMPLE_SIZE = 5
+EXAMPLE_SIZE = 10
 EXAMPLE_SIZE_TYPE = "fixed"
-MATCHING_TYPE = 'edit_dist'  # ["exact", "edit_dist"]
-CLASSIFICATION_TYPE = 'golden'  # ['golden', gpt_classifier', 'all_string']
+MATCHING_TYPE = "exact"
+CLASSIFICATION_TYPE = "gpt_classifier"
 
 TEST_ON_ALL_DATA = False
 
+DS_PATH = str(BASE_PATH / "data/autofj/Artwork")
+DS_NAME = "autofj_Artwork_qgram_gt_filtered_seed0_edit"
 
-# DS_PATH = str(BASE_PATH / "data/Datasets/AutoJoin")
-# DS_PATH = str(BASE_PATH / "data/Datasets/FlashFill")
-# DS_PATH = str(BASE_PATH / "data/Datasets/DataXFormer")
-DS_PATH = str(BASE_PATH / "data/Datasets/All_TDE")
-DS_NAME = pathlib.PurePath(DS_PATH).name
 
 class_str = "" if CLASSIFICATION_TYPE == "golden" else f"_{CLASSIFICATION_TYPE}"
 if BASIC_PROMPT:
@@ -56,8 +63,7 @@ if BASIC_PROMPT:
 
 
 model_str = MODEL_NAME.replace("-2024-05-13", "").replace("-2024-07-18", "")
-OUTPUT_DIR = BASE_PATH / f"data/output{class_str}_{model_str}/{DS_NAME}_PIPELINE_{EXAMPLE_SIZE}sets_{MATCHING_TYPE}"
-
+OUTPUT_DIR = BASE_PATH / "outputs/autofj_Artwork_qgram_gt_filtered_seed0_edit_logged"
 
 # Init edit distance cache
 ed_cache_dict = None
@@ -88,11 +94,17 @@ def edit_distance_func(val1, val2):
 
 
 
-def get_classes(method, tbl_name, ds_path):
+def get_classes(method, tbl_name, ds_path, train_examples=None):
     if method == "golden":
         return get_gold_label(tbl_name, ds_path)
     elif method == "gpt_classifier":
-        return get_gpt_label(tbl_name, ds_path)
+        return get_gpt_label(
+            tbl_name,
+            ds_path,
+            train_examples=train_examples,
+            model_name=MODEL_NAME,
+            prompt_version=PROMPT_VERSION,
+        )
     elif method == "all_string":
         return "String"
     else:
@@ -240,13 +252,26 @@ def main():
     if os.path.exists(OUTPUT_DIR):
         shutil.rmtree(OUTPUT_DIR)
     pathlib.Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    configure_llm_logging(
+        OUTPUT_DIR,
+        dataset=pathlib.Path(DS_PATH).name,
+        ds_name=DS_NAME,
+        ds_path=DS_PATH,
+        model_name=MODEL_NAME,
+        prompt_version=PROMPT_VERSION,
+        basic_prompt=BASIC_PROMPT,
+        example_size=EXAMPLE_SIZE,
+        example_size_type=EXAMPLE_SIZE_TYPE,
+        matching_type=MATCHING_TYPE,
+        classification_type=CLASSIFICATION_TYPE,
+    )
 
     out_file_path = OUTPUT_DIR / "_res.csv"
 
     tables = sample_data(DS_PATH, EXAMPLE_SIZE, EXAMPLE_SIZE_TYPE)
 
 
-    f = open(out_file_path, 'w')
+    f = open(out_file_path, 'w', encoding='utf-8', newline='')
 
     title_str = "id,class,P,R,F1,correct,len,gen_functions,avg_edit_dist,avg_norm_edit_dist,Time"
     print(title_str)
@@ -258,9 +283,15 @@ def main():
         start_time = time.time()
 
         print(f"{i}/{len(tables)}: {table}", end=',')
+        set_llm_context(table=table, table_index=i)
         i += 1
 
-        cls = get_classes(CLASSIFICATION_TYPE, table, DS_PATH)
+        cls = get_classes(
+            CLASSIFICATION_TYPE,
+            table,
+            DS_PATH,
+            train_examples=tables[table]['train'],
+        )
         assert cls in classifierutil.ALLOWED_CLASSES
 
         if BASIC_PROMPT:
@@ -328,7 +359,7 @@ def main():
         if f is not None:
             print(f"{table},{val_str}", file=f)
 
-        with open(OUTPUT_DIR / f"{table}.txt", 'w') as f2:
+        with open(OUTPUT_DIR / f"{table}.txt", 'w', encoding='utf-8', errors='replace') as f2:
             print(f"P, R, F = {je.short_str()}", file=f2)
             print(f"Class: {cls}", file=f2)
             print(f"Correct Predictions: {correct_cnt}", file=f2)
@@ -351,6 +382,7 @@ def main():
         _save_ed_cache()
 
     f.close()
+    flush_llm_summary(completed=True)
 
 
 if __name__ == "__main__":

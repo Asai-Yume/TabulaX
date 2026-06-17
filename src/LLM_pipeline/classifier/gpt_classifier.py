@@ -15,6 +15,36 @@ PROMPT_CACHE_PATH = BASE_PATH / "cache/classifier_prompts"
 with open(BASE_PATH / 'openai.key', 'r') as f:
     API_KEY = f.read()
 
+with open(BASE_PATH / 'openrouter.key', 'r') as f:
+    OPENROUTER_API_KEY = f.read().strip()
+
+
+def get_openrouter_model_name(model_name):
+    override = os.getenv("OPENROUTER_MODEL", "").strip()
+    if override:
+        return override
+
+    if model_name.startswith("gpt-4o-mini"):
+        return "openai/gpt-4o-mini"
+    if model_name.startswith("gpt-4o"):
+        return "openai/gpt-4o"
+
+    return "openai/gpt-4o-mini"
+
+
+def get_gpt_client_and_model(model_name):
+    if os.getenv("USE_OPENROUTER", "0") == "1":
+        return openai.OpenAI(
+            api_key=OPENROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={
+                "HTTP-Referer": "http://localhost",
+                "X-OpenRouter-Title": "TabulaX replication",
+            },
+        ), get_openrouter_model_name(model_name)
+
+    return openai.OpenAI(api_key=API_KEY), model_name
+
 MODEL_NAME = "gpt-4o-2024-05-13"
 # MODEL_NAME = "gpt-4o-mini-2024-07-18"
 PROMPT_VERSION = "v002"
@@ -35,10 +65,10 @@ from report_metrics import report_metrics
 EXAMPLE_SIZE = 5
 EXAMPLE_SIZE_TYPE = "fixed"
 DS_PATHS = [
-    str(BASE_PATH / "data/Datasets/DataXFormer"),
-    str(BASE_PATH / "data/Datasets/AutoJoin"),
-    str(BASE_PATH / "data/Datasets/FlashFill"),
-    str(BASE_PATH / "data/Datasets/All_TDE"),
+    str(BASE_PATH / "data/kbwt"),
+    str(BASE_PATH / "data/wt"),
+    str(BASE_PATH / "data/ss"),
+    str(BASE_PATH / "data/autofj"),
     ]
 
 
@@ -69,9 +99,9 @@ def get_prediction(examples):
         respond = cache_dict[prompt].choices[0].message.content
         # print("Hit cache")
     else:
-        client = openai.OpenAI(api_key=API_KEY)
+        client, api_model_name = get_gpt_client_and_model(MODEL_NAME)
         completion = client.chat.completions.create(
-            model=MODEL_NAME,
+            model=api_model_name,
             messages=[
                 {"role": "user", "content": prompt}
             ],
