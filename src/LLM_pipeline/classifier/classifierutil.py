@@ -100,6 +100,69 @@ def _get_client_and_model(model_name: str | None):
     return openai.OpenAI(api_key=_read_secret("OPENAI_API_KEY", "openai.key")), model_name
 
 
+def _is_openrouter_gpt5_model(api_model_name: str | None) -> bool:
+    return (
+        os.getenv("USE_OPENROUTER", "0") == "1"
+        and api_model_name is not None
+        and "gpt-5" in api_model_name.lower()
+    )
+
+
+def _chat_completion_kwargs(api_model_name: str, messages: list[dict]) -> dict:
+    """
+    Build model-specific chat completion kwargs.
+
+    GPT-5 models can spend output tokens on hidden reasoning, so the old
+    max_tokens=100 setting can produce content=None even when the API call succeeds.
+    """
+    kwargs = {
+        "model": api_model_name,
+        "messages": messages,
+    }
+
+    if _is_openrouter_gpt5_model(api_model_name):
+        kwargs["max_tokens"] = int(os.getenv("OPENROUTER_MAX_TOKENS", "1024"))
+        kwargs["extra_body"] = {
+            "reasoning": {
+                "effort": os.getenv("OPENROUTER_REASONING_EFFORT", "low"),
+                "exclude": True,
+            }
+        }
+    else:
+        kwargs["temperature"] = 0.0000001
+        kwargs["seed"] = 12345
+        kwargs["max_tokens"] = 100
+
+    return kwargs
+
+
+def _extract_response_text(completion) -> str | None:
+    """
+    Extract visible text from OpenAI/OpenRouter chat completion responses.
+    """
+    if completion is None or not getattr(completion, "choices", None):
+        return None
+
+    message = completion.choices[0].message
+    content = getattr(message, "content", None)
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") in ("text", "output_text"):
+                    parts.append(item.get("text", ""))
+                elif "text" in item:
+                    parts.append(item["text"])
+        joined = "".join(parts).strip()
+        return joined or None
+
+    return None
+
+
 def _prompt_model_dir(model_name: str | None) -> str:
     """Map API model names to the prompt directory used by the TabulaX repo."""
     model_name = model_name or "gpt-4o-2024-05-13"
@@ -171,7 +234,7 @@ def _predict_class_from_examples(
 
     if prompt in cache_dict:
         completion = cache_dict[prompt]
-        respond = completion.choices[0].message.content
+        respond = _extract_response_text(completion)
         log_llm_call(
             "classifier",
             model_name,
@@ -189,12 +252,15 @@ def _predict_class_from_examples(
         client, api_model_name = _get_client_and_model(model_name)
         started = time.perf_counter()
         try:
+            # completion = client.chat.completions.create(
+            #     model=api_model_name,
+            #     messages=messages,
+            #     temperature=0.0000001,
+            #     seed=12345,
+            #     max_tokens=100,
+            # )
             completion = client.chat.completions.create(
-                model=api_model_name,
-                messages=messages,
-                temperature=0.0000001,
-                seed=12345,
-                max_tokens=100,
+                **_chat_completion_kwargs(api_model_name, messages)
             )
         except Exception as exc:
             log_llm_call(
@@ -212,7 +278,7 @@ def _predict_class_from_examples(
                 dataset=ds_name,
             )
             raise
-        respond = completion.choices[0].message.content
+        respond = _extract_response_text(completion)
         duration_sec = time.perf_counter() - started
         log_llm_call(
             "classifier",
@@ -232,6 +298,19 @@ def _predict_class_from_examples(
 
         with open(cache_file, "wb") as fp:
             pickle.dump(cache_dict, fp)
+
+    if respond is None or not str(respond).strip():
+        finish_reason = None
+        try:
+            finish_reason = completion.choices[0].finish_reason
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            "GPT classifier returned no visible text. "
+            f"api_model={api_model_name!r}, finish_reason={finish_reason!r}. "
+            "For GPT-5-mini, increase OPENROUTER_MAX_TOKENS or lower reasoning effort."
+        )
 
     out = re.split(r"\s+", respond.replace("Class:", "").strip())[0]
     if out in ALLOWED_CLASSES:
