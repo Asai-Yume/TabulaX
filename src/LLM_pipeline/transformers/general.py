@@ -5,6 +5,11 @@ import time
 
 import openai
 from llm_logging import get_llm_provider, log_llm_call
+from transformers.llm_common import (
+    chat_completion_kwargs,
+    extract_response_text,
+    require_response_text,
+)
 
 
 USE_TQDM = False
@@ -134,7 +139,7 @@ def get_relation(examples, model_name, prompt_version):
 
     if prompt in cache_dict:
         completion = cache_dict[prompt]
-        respond = completion.choices[0].message.content
+        respond = extract_response_text(completion)
         log_llm_call(
             "general_relation",
             model_name,
@@ -153,12 +158,7 @@ def get_relation(examples, model_name, prompt_version):
         started = time.perf_counter()
         try:
             completion = client.chat.completions.create(
-                model=api_model_name,
-                messages=messages,
-                temperature=0.0000001,
-                seed=12345,
-                max_tokens=1000,
-                # frequency_penalty=0.0
+                **chat_completion_kwargs(api_model_name, messages, max_tokens=1000)
             )
         except Exception as exc:
             log_llm_call(
@@ -174,7 +174,7 @@ def get_relation(examples, model_name, prompt_version):
                 api_model=api_model_name,
             )
             raise
-        respond = completion.choices[0].message.content
+        respond = extract_response_text(completion)
         duration_sec = time.perf_counter() - started
         log_llm_call(
             "general_relation",
@@ -188,11 +188,13 @@ def get_relation(examples, model_name, prompt_version):
             api_model=api_model_name,
             completion=completion,
         )
+        respond = require_response_text(respond, "general_relation", api_model_name, completion)
         cache_dict[prompt] = completion
 
         with open(cache_file, 'wb') as fp:
             pickle.dump(cache_dict, fp)
 
+    respond = require_response_text(respond, "general_relation", api_model_name, completion)
     out = respond.replace("Relationship:", "").strip()
     return out
 
@@ -220,7 +222,7 @@ def predict_bridge_value(examples, src, relation_array, model_name, prompt_versi
     # print(f"=========\n{prompt}\n***")
     if prompt in bridge_cache_dict:
         completion = bridge_cache_dict[prompt]
-        respond = completion.choices[0].message.content
+        respond = extract_response_text(completion)
         log_llm_call(
             "general_predict_bridge",
             model_name,
@@ -242,12 +244,7 @@ def predict_bridge_value(examples, src, relation_array, model_name, prompt_versi
         started = time.perf_counter()
         try:
             completion = client.chat.completions.create(
-                model=api_model_name,
-                messages=messages,
-                temperature=0.0000001,
-                seed=12345,
-                max_tokens=100,
-                # frequency_penalty=0.0
+                **chat_completion_kwargs(api_model_name, messages, max_tokens=100)
             )
         except Exception as exc:
             log_llm_call(
@@ -266,7 +263,7 @@ def predict_bridge_value(examples, src, relation_array, model_name, prompt_versi
                 target_type=relation_array[1],
             )
             raise
-        respond = completion.choices[0].message.content
+        respond = extract_response_text(completion)
         duration_sec = time.perf_counter() - started
         log_llm_call(
             "general_predict_bridge",
@@ -283,6 +280,7 @@ def predict_bridge_value(examples, src, relation_array, model_name, prompt_versi
             src_type=relation_array[0],
             target_type=relation_array[1],
         )
+        respond = require_response_text(respond, "general_predict_bridge", api_model_name, completion)
         bridge_cache_dict[prompt] = completion
 
         with open(bridge_cache_file, 'wb') as fp:
@@ -291,6 +289,7 @@ def predict_bridge_value(examples, src, relation_array, model_name, prompt_versi
         if sleep > 0:
             time.sleep(sleep)
 
+    respond = require_response_text(respond, "general_predict_bridge", api_model_name, completion)
     out = respond.strip()
     if model_name == "llama3.1-8b":
         out = out.split("-> ")[-1].strip()
