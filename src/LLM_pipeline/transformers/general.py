@@ -1,10 +1,16 @@
 import os
 import pathlib
 import pickle
+import sys
 import time
 
 import openai
 from llm_logging import get_llm_provider, log_llm_call
+from transformers.llm_common import (
+    chat_completion_kwargs,
+    extract_response_text,
+    require_response_text,
+)
 
 
 USE_TQDM = False
@@ -134,7 +140,7 @@ def get_relation(examples, model_name, prompt_version):
 
     if prompt in cache_dict:
         completion = cache_dict[prompt]
-        respond = completion.choices[0].message.content
+        respond = extract_response_text(completion)
         log_llm_call(
             "general_relation",
             model_name,
@@ -153,12 +159,7 @@ def get_relation(examples, model_name, prompt_version):
         started = time.perf_counter()
         try:
             completion = client.chat.completions.create(
-                model=api_model_name,
-                messages=messages,
-                temperature=0.0000001,
-                seed=12345,
-                max_tokens=1000,
-                # frequency_penalty=0.0
+                **chat_completion_kwargs(api_model_name, messages, max_tokens=1000)
             )
         except Exception as exc:
             log_llm_call(
@@ -174,7 +175,7 @@ def get_relation(examples, model_name, prompt_version):
                 api_model=api_model_name,
             )
             raise
-        respond = completion.choices[0].message.content
+        respond = extract_response_text(completion)
         duration_sec = time.perf_counter() - started
         log_llm_call(
             "general_relation",
@@ -188,11 +189,13 @@ def get_relation(examples, model_name, prompt_version):
             api_model=api_model_name,
             completion=completion,
         )
+        respond = require_response_text(respond, "general_relation", api_model_name, completion)
         cache_dict[prompt] = completion
 
         with open(cache_file, 'wb') as fp:
             pickle.dump(cache_dict, fp)
 
+    respond = require_response_text(respond, "general_relation", api_model_name, completion)
     out = respond.replace("Relationship:", "").strip()
     return out
 
@@ -218,9 +221,10 @@ def predict_bridge_value(examples, src, relation_array, model_name, prompt_versi
     provider = get_llm_provider(model_name)
     api_model_name = get_openrouter_model_name(model_name) if provider == "openrouter" else model_name
     # print(f"=========\n{prompt}\n***")
+
     if prompt in bridge_cache_dict:
         completion = bridge_cache_dict[prompt]
-        respond = completion.choices[0].message.content
+        respond = extract_response_text(completion)
         log_llm_call(
             "general_predict_bridge",
             model_name,
@@ -239,57 +243,85 @@ def predict_bridge_value(examples, src, relation_array, model_name, prompt_versi
     else:
         client, api_model_name = get_gpt_client_and_model(model_name)
 
-        started = time.perf_counter()
-        try:
-            completion = client.chat.completions.create(
-                model=api_model_name,
-                messages=messages,
-                temperature=0.0000001,
-                seed=12345,
-                max_tokens=100,
-                # frequency_penalty=0.0
-            )
-        except Exception as exc:
+        max_attempts = max(1, int(os.getenv("TABULAX_EMPTY_RESPONSE_RETRIES", "2")) + 1)
+        completion = None
+        respond = None
+
+        for attempt in range(1, max_attempts + 1):
+            started = time.perf_counter()
+            try:
+                completion = client.chat.completions.create(
+                    **chat_completion_kwargs(api_model_name, messages, max_tokens=100)
+                )
+            except Exception as exc:
+                log_llm_call(
+                    "general_predict_bridge",
+                    model_name,
+                    prompt=prompt,
+                    messages=messages,
+                    duration_sec=time.perf_counter() - started,
+                    success=False,
+                    error_message=repr(exc),
+                    cached=False,
+                    provider=provider,
+                    api_model=api_model_name,
+                    src_value=src,
+                    src_type=relation_array[0],
+                    target_type=relation_array[1],
+                )
+                raise
+
+            respond = extract_response_text(completion)
+            duration_sec = time.perf_counter() - started
             log_llm_call(
                 "general_predict_bridge",
                 model_name,
                 prompt=prompt,
                 messages=messages,
-                duration_sec=time.perf_counter() - started,
-                success=False,
-                error_message=repr(exc),
+                response=respond,
+                duration_sec=duration_sec,
                 cached=False,
                 provider=provider,
                 api_model=api_model_name,
+                completion=completion,
                 src_value=src,
                 src_type=relation_array[0],
                 target_type=relation_array[1],
             )
-            raise
-        respond = completion.choices[0].message.content
-        duration_sec = time.perf_counter() - started
-        log_llm_call(
-            "general_predict_bridge",
-            model_name,
-            prompt=prompt,
-            messages=messages,
-            response=respond,
-            duration_sec=duration_sec,
-            cached=False,
-            provider=provider,
-            api_model=api_model_name,
-            completion=completion,
-            src_value=src,
-            src_type=relation_array[0],
-            target_type=relation_array[1],
-        )
-        bridge_cache_dict[prompt] = completion
 
-        with open(bridge_cache_file, 'wb') as fp:
-            pickle.dump(bridge_cache_dict, fp)
+            if respond is not None and str(respond).strip():
+                break
+
+            if attempt < max_attempts:
+                print(
+                    f"[TabulaX general_predict_bridge] Empty response for src={src!r}; "
+                    f"retrying attempt {attempt + 1}/{max_attempts}",
+                    file=sys.stderr,
+                )
+
+        if respond is not None and str(respond).strip():
+            bridge_cache_dict[prompt] = completion
+
+            with open(bridge_cache_file, 'wb') as fp:
+                pickle.dump(bridge_cache_dict, fp)
+        else:
+            print(
+                f"[TabulaX general_predict_bridge] Empty response for src={src!r} "
+                f"after {max_attempts} attempt(s); using empty bridge value so the run can continue.",
+                file=sys.stderr,
+            )
+            return ""
 
         if sleep > 0:
             time.sleep(sleep)
+
+    if respond is None or not str(respond).strip():
+        print(
+            f"[TabulaX general_predict_bridge] Cached empty response for src={src!r}; "
+            "using empty bridge value so the run can continue.",
+            file=sys.stderr,
+        )
+        return ""
 
     out = respond.strip()
     if model_name == "llama3.1-8b":

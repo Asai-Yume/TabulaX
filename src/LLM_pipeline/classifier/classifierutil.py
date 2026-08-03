@@ -100,6 +100,69 @@ def _get_client_and_model(model_name: str | None):
     return openai.OpenAI(api_key=_read_secret("OPENAI_API_KEY", "openai.key")), model_name
 
 
+def _is_openrouter_gpt5_model(api_model_name: str | None) -> bool:
+    return (
+        os.getenv("USE_OPENROUTER", "0") == "1"
+        and api_model_name is not None
+        and "gpt-5" in api_model_name.lower()
+    )
+
+
+def _chat_completion_kwargs(api_model_name: str, messages: list[dict]) -> dict:
+    """
+    Build model-specific chat completion kwargs.
+
+    GPT-5 models can spend output tokens on hidden reasoning, so the old
+    max_tokens=100 setting can produce content=None even when the API call succeeds.
+    """
+    kwargs = {
+        "model": api_model_name,
+        "messages": messages,
+    }
+
+    if _is_openrouter_gpt5_model(api_model_name):
+        kwargs["max_tokens"] = int(os.getenv("OPENROUTER_MAX_TOKENS", "1024"))
+        kwargs["extra_body"] = {
+            "reasoning": {
+                "effort": os.getenv("OPENROUTER_REASONING_EFFORT", "low"),
+                "exclude": True,
+            }
+        }
+    else:
+        kwargs["temperature"] = 0.0000001
+        kwargs["seed"] = 12345
+        kwargs["max_tokens"] = 100
+
+    return kwargs
+
+
+def _extract_response_text(completion) -> str | None:
+    """
+    Extract visible text from OpenAI/OpenRouter chat completion responses.
+    """
+    if completion is None or not getattr(completion, "choices", None):
+        return None
+
+    message = completion.choices[0].message
+    content = getattr(message, "content", None)
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") in ("text", "output_text"):
+                    parts.append(item.get("text", ""))
+                elif "text" in item:
+                    parts.append(item["text"])
+        joined = "".join(parts).strip()
+        return joined or None
+
+    return None
+
+
 def _prompt_model_dir(model_name: str | None) -> str:
     """Map API model names to the prompt directory used by the TabulaX repo."""
     model_name = model_name or "gpt-4o-2024-05-13"
@@ -127,6 +190,143 @@ def _save_json_cache(labels_dict: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(labels_dict, f, indent=2, ensure_ascii=False)
+
+
+def _canonical_class_label(value: str | None) -> str | None:
+    """
+    Return the canonical TabulaX class name when value contains exactly one
+    class label, ignoring capitalization and common formatting.
+    """
+    if value is None:
+        return None
+
+    cleaned = str(value).strip()
+    cleaned = re.sub(
+        r"^class(?:ification)?\s*:\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = cleaned.strip(" \t\r\n`*_.,:;!?()[]{}\"'")
+
+    for allowed_class in ALLOWED_CLASSES:
+        if cleaned.casefold() == allowed_class.casefold():
+            return allowed_class
+
+    return None
+
+
+def _parse_classifier_response(respond: str) -> str:
+    """
+    Parse either:
+
+        General
+        Class: General
+
+    or GPT-5 responses that classify each example separately:
+
+        ("a" -> "b"): String
+        ("c" -> "d"): General
+        ("e" -> "f"): General
+
+    For per-example classifications, use the unique majority label.
+    """
+    text = str(respond).strip()
+
+    # Preferred case: the complete response is exactly one class.
+    direct_label = _canonical_class_label(text)
+    if direct_label is not None:
+        return direct_label
+
+    class_pattern = "|".join(
+        re.escape(label) for label in ALLOWED_CLASSES
+    )
+
+    # Prefer an explicit dataset-level or overall classification when present.
+    overall_patterns = [
+        rf"(?im)^\s*(?:overall\s+)?class(?:ification)?\s*:\s*"
+        rf"({class_pattern})\s*[.!`*_]*\s*$",
+        rf"(?im)^\s*overall\s*:\s*"
+        rf"({class_pattern})\s*[.!`*_]*\s*$",
+    ]
+
+    for pattern in overall_patterns:
+        match = re.search(pattern, text)
+        if match:
+            label = _canonical_class_label(match.group(1))
+            if label is not None:
+                return label
+
+    # Handle one label per example, such as:
+    # ("source" -> "target"): General
+    extracted_labels = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        line_label = _canonical_class_label(line)
+        if line_label is not None:
+            extracted_labels.append(line_label)
+            continue
+
+        match = re.search(
+            rf":\s*({class_pattern})\s*[.!`*_]*\s*$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            label = _canonical_class_label(match.group(1))
+            if label is not None:
+                extracted_labels.append(label)
+
+    if extracted_labels:
+        counts = {
+            label: extracted_labels.count(label)
+            for label in ALLOWED_CLASSES
+            if label in extracted_labels
+        }
+
+        highest_count = max(counts.values())
+        winners = [
+            label
+            for label, count in counts.items()
+            if count == highest_count
+        ]
+
+        if len(winners) == 1:
+            prediction = winners[0]
+            print(
+                "[TabulaX classifier] Parsed per-example labels "
+                f"{counts}; using majority class {prediction}"
+            )
+            return prediction
+
+        raise ValueError(
+            "Classifier returned tied per-example class labels: "
+            f"{counts}; full response={respond!r}"
+        )
+
+    # Last fallback: accept a class when it is the only allowed class
+    # mentioned anywhere in the response.
+    mentioned_labels = [
+        label
+        for label in ALLOWED_CLASSES
+        if re.search(
+            rf"\b{re.escape(label)}\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    ]
+
+    if len(mentioned_labels) == 1:
+        return mentioned_labels[0]
+
+    raise ValueError(
+        "Could not extract one valid classifier label from "
+        f"response={respond!r}"
+    )
 
 
 def _predict_class_from_examples(
@@ -171,7 +371,7 @@ def _predict_class_from_examples(
 
     if prompt in cache_dict:
         completion = cache_dict[prompt]
-        respond = completion.choices[0].message.content
+        respond = _extract_response_text(completion)
         log_llm_call(
             "classifier",
             model_name,
@@ -189,12 +389,15 @@ def _predict_class_from_examples(
         client, api_model_name = _get_client_and_model(model_name)
         started = time.perf_counter()
         try:
+            # completion = client.chat.completions.create(
+            #     model=api_model_name,
+            #     messages=messages,
+            #     temperature=0.0000001,
+            #     seed=12345,
+            #     max_tokens=100,
+            # )
             completion = client.chat.completions.create(
-                model=api_model_name,
-                messages=messages,
-                temperature=0.0000001,
-                seed=12345,
-                max_tokens=100,
+                **_chat_completion_kwargs(api_model_name, messages)
             )
         except Exception as exc:
             log_llm_call(
@@ -212,7 +415,7 @@ def _predict_class_from_examples(
                 dataset=ds_name,
             )
             raise
-        respond = completion.choices[0].message.content
+        respond = _extract_response_text(completion)
         duration_sec = time.perf_counter() - started
         log_llm_call(
             "classifier",
@@ -233,11 +436,20 @@ def _predict_class_from_examples(
         with open(cache_file, "wb") as fp:
             pickle.dump(cache_dict, fp)
 
-    out = re.split(r"\s+", respond.replace("Class:", "").strip())[0]
-    if out in ALLOWED_CLASSES:
-        return out
+    if respond is None or not str(respond).strip():
+        finish_reason = None
+        try:
+            finish_reason = completion.choices[0].finish_reason
+        except Exception:
+            pass
 
-    raise ValueError(f"Invalid classifier output: {out!r}; full response={respond!r}")
+        raise RuntimeError(
+            "GPT classifier returned no visible text. "
+            f"api_model={api_model_name!r}, finish_reason={finish_reason!r}. "
+            "For GPT-5-mini, increase OPENROUTER_MAX_TOKENS or lower reasoning effort."
+        )
+
+    return _parse_classifier_response(respond)
 
 
 def get_gpt_label(

@@ -61,6 +61,8 @@ openrouter.key
 outputs/
 example_manifests/
 tabulax_autofj_summary.csv
+analysis/
+visualization/
 
 # Local backup files
 *.bak

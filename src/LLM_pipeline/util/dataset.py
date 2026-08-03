@@ -1,4 +1,5 @@
 import csv
+import math
 import os
 import random
 
@@ -186,28 +187,99 @@ def _split_with_manifest(table_id, rows, example_size):
 def sample_data(ds_path, example_size, example_size_type="fixed"):
     pairs = get_pairs_from_files(ds_path, [])
 
-    tables = dict()
+    tables = {}
 
-    for table, rows in pairs['inputs'].items():
-        # print(f"working on {table}")
-        random.seed(RANDOM_SEED)
-        random.shuffle(rows)
-        # print(rows[1])
+    seed_text = os.getenv("TABULAX_EXAMPLE_SEED", str(RANDOM_SEED))
+    try:
+        example_seed = int(seed_text)
+    except ValueError as exc:
+        raise ValueError(
+            f"TABULAX_EXAMPLE_SEED must be an integer, got {seed_text!r}"
+        ) from exc
 
-        manifest_split = _split_with_manifest(table, rows, example_size)
+    example_size_type = str(example_size_type).strip().lower()
+
+    for table, original_rows in pairs["inputs"].items():
+        # Copy the list so the original loaded data is not modified in place.
+        rows = list(original_rows)
+        gt_size = len(rows)
+
+        # At least one example and one positive test pair are required.
+        if gt_size < 2:
+            print(
+                f"[TabulaX sampling] skipping table={table!r}: "
+                f"only {gt_size} ground-truth pair(s)"
+            )
+            continue
+
+        if example_size_type == "fixed":
+            train_size = min(
+                max(1, int(example_size)),
+                gt_size - 1,
+            )
+
+        elif example_size_type in {"fraction", "percentage", "percent"}:
+            fraction_text = os.getenv(
+                "TABULAX_EXAMPLE_FRACTION",
+                "0.25",
+            )
+
+            try:
+                example_fraction = float(fraction_text)
+            except ValueError as exc:
+                raise ValueError(
+                    "TABULAX_EXAMPLE_FRACTION must be a number, "
+                    f"got {fraction_text!r}"
+                ) from exc
+
+            if not 0 < example_fraction < 1:
+                raise ValueError(
+                    "TABULAX_EXAMPLE_FRACTION must be greater than 0 "
+                    f"and less than 1, got {example_fraction}"
+                )
+
+            # Mentor-approved rule:
+            # max(1, ceil(0.25 * gt_size))
+            # Also cap it so at least one GT pair remains for testing.
+            train_size = min(
+                gt_size - 1,
+                max(1, math.ceil(example_fraction * gt_size)),
+            )
+
+        else:
+            raise ValueError(
+                "Unsupported example_size_type "
+                f"{example_size_type!r}. Expected 'fixed' or 'fraction'."
+            )
+
+        # Use the requested experiment seed instead of always using 12345.
+        rng = random.Random(example_seed)
+        rng.shuffle(rows)
+
+        # If a manifest is explicitly enabled, use the calculated number
+        # of examples rather than the fixed example_size argument.
+        manifest_split = _split_with_manifest(
+            table,
+            rows,
+            train_size,
+        )
+
         if manifest_split is not None:
             tables[table] = manifest_split
             continue
 
-        if example_size_type == "fixed":
-            train_size = min(example_size, len(rows) - 1)
-        else:
-            raise NotImplementedError
-            train_size = max(2, len(rows) * example_size)
-
         tables[table] = {
-            'train': rows[:train_size],
-            'test': rows[train_size:],
+            "train": rows[:train_size],
+            "test": rows[train_size:],
         }
+
+        print(
+            f"[TabulaX sampling] table={table!r} "
+            f"seed={example_seed} "
+            f"gt_size={gt_size} "
+            f"type={example_size_type} "
+            f"train={train_size} "
+            f"test={gt_size - train_size}"
+        )
 
     return tables

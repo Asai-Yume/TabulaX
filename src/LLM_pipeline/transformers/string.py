@@ -45,6 +45,61 @@ def get_gpt_client_and_model(model_name):
 
     return openai.OpenAI(api_key=API_KEY), model_name    
 
+
+def is_openrouter_gpt5_model(api_model_name):
+    return (
+        os.getenv("USE_OPENROUTER", "0") == "1"
+        and api_model_name is not None
+        and "gpt-5" in api_model_name.lower()
+    )
+
+
+def chat_completion_kwargs(api_model_name, messages):
+    kwargs = {
+        "model": api_model_name,
+        "messages": messages,
+    }
+
+    if is_openrouter_gpt5_model(api_model_name):
+        kwargs["max_tokens"] = int(os.getenv("OPENROUTER_MAX_TOKENS", "4096"))
+        kwargs["extra_body"] = {
+            "reasoning": {
+                "effort": os.getenv("OPENROUTER_REASONING_EFFORT", "low"),
+                "exclude": True,
+            }
+        }
+    else:
+        kwargs["temperature"] = 0.0000001
+        kwargs["seed"] = 12345
+        kwargs["max_tokens"] = 1000
+
+    return kwargs
+
+
+def extract_response_text(completion):
+    if completion is None or not getattr(completion, "choices", None):
+        return None
+
+    message = completion.choices[0].message
+    content = getattr(message, "content", None)
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") in ("text", "output_text"):
+                    parts.append(item.get("text", ""))
+                elif "text" in item:
+                    parts.append(item["text"])
+        joined = "".join(parts).strip()
+        return joined or None
+
+    return None
+
+
 with open(BASE_PATH / 'deepseek.key', 'r') as f:
     DEEPSEEK_API_KEY = f.read()
 
@@ -82,7 +137,7 @@ def get_code(examples, model_name, prompt_version):
 
     if prompt in cache_dict:
         completion = cache_dict[prompt]
-        respond = completion.choices[0].message.content
+        respond = extract_response_text(completion)
         api_model_name = get_openrouter_model_name(model_name) if get_llm_provider(model_name) == "openrouter" else model_name
         log_llm_call(
             "string_transformer",
@@ -115,13 +170,8 @@ def get_code(examples, model_name, prompt_version):
         started = time.perf_counter()
         try:
             completion = client.chat.completions.create(
-                model=api_model_name,
-                messages=messages,
-                temperature=0.0000001,
-                seed=12345,
-                max_tokens=1000,
-                # frequency_penalty=0.0
-            )
+                **chat_completion_kwargs(api_model_name, messages)
+            )   
         except Exception as exc:
             log_llm_call(
                 "string_transformer",
@@ -136,7 +186,7 @@ def get_code(examples, model_name, prompt_version):
                 api_model=api_model_name,
             )
             raise
-        respond = completion.choices[0].message.content
+        respond = extract_response_text(completion)
         duration_sec = time.perf_counter() - started
         log_llm_call(
             "string_transformer",
@@ -150,11 +200,30 @@ def get_code(examples, model_name, prompt_version):
             api_model=api_model_name,
             completion=completion,
         )
+        
+        if respond is None or not str(respond).strip():
+            finish_reason = None
+            try:
+                finish_reason = completion.choices[0].finish_reason
+            except Exception:
+                pass
+
+            raise RuntimeError(
+                "String transformer returned no visible text. "
+                f"api_model={api_model_name!r}, finish_reason={finish_reason!r}. "
+                "For GPT-5-mini, increase OPENROUTER_MAX_TOKENS or lower reasoning effort."
+            )
+        
         cache_dict[prompt] = completion
 
         with open(cache_file, 'wb') as fp:
             pickle.dump(cache_dict, fp)
 
+    if respond is None or not str(respond).strip():
+        raise RuntimeError(
+            "String transformer response is empty after cache/live extraction. "
+            "Clear cache\\str_code_prompts and rerun."
+        )
 
     return respond, {
         'prompt': prompt,
