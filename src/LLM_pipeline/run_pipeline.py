@@ -46,8 +46,52 @@ MODEL_NAME = "gpt-4o-mini-2024-07-18"
 PROMPT_VERSION = "v001"
 BASIC_PROMPT = False
 
-EXAMPLE_SIZE = 10
-EXAMPLE_SIZE_TYPE = "fixed"
+# Example-selection configuration.
+#
+# Fixed mode:
+#   TABULAX_EXAMPLE_SIZE_TYPE=fixed
+#   TABULAX_EXAMPLE_SIZE=5
+#
+# Fraction mode:
+#   TABULAX_EXAMPLE_SIZE_TYPE=fraction
+#   TABULAX_EXAMPLE_FRACTION=0.25
+
+_example_size_text = os.getenv(
+    "TABULAX_EXAMPLE_SIZE",
+    "10",
+).strip()
+
+# Allow TABULAX_EXAMPLE_SIZE to be empty in fraction mode.
+EXAMPLE_SIZE = int(_example_size_text) if _example_size_text else 10
+
+EXAMPLE_SIZE_TYPE = os.getenv(
+    "TABULAX_EXAMPLE_SIZE_TYPE",
+    "fixed",
+).strip().lower()
+
+EXAMPLE_FRACTION = float(
+    os.getenv(
+        "TABULAX_EXAMPLE_FRACTION",
+        "0.25",
+    )
+)
+
+if EXAMPLE_SIZE_TYPE not in {
+    "fixed",
+    "fraction",
+    "percentage",
+    "percent",
+}:
+    raise ValueError(
+        "TABULAX_EXAMPLE_SIZE_TYPE must be 'fixed' or 'fraction', "
+        f"got {EXAMPLE_SIZE_TYPE!r}"
+    )
+
+if EXAMPLE_SIZE_TYPE != "fixed" and not 0 < EXAMPLE_FRACTION < 1:
+    raise ValueError(
+        "TABULAX_EXAMPLE_FRACTION must be greater than 0 and "
+        f"less than 1, got {EXAMPLE_FRACTION}"
+    )
 # - TABULAX_MATCHING_TYPE=edit_dist for single matching type
 # - TABULAX_MATCHING_TYPES=edit_dist,exact lets us evaluate both from one LLM run
 MATCHING_TYPE = os.getenv("TABULAX_MATCHING_TYPE", "edit_dist")
@@ -226,6 +270,35 @@ def normalize_generated_value(val):
     return val
 
 
+def parse_numeric_value(val):
+    """
+    Convert numeric join values to float safely.
+
+    The numeric transformer can return strings such as "37.0" while the
+    numeric join path expects numbers. This helper keeps those string outputs
+    valid and lets unparseable values count as no prediction instead of
+    crashing the run.
+    """
+    if val is None:
+        raise ValueError("Cannot parse None as a number")
+
+    if isinstance(val, (int, float)):
+        if isinstance(val, float) and math.isnan(val):
+            raise ValueError("Cannot parse NaN as a number")
+        return float(val)
+
+    text = str(val).strip()
+    if not text:
+        raise ValueError("Cannot parse empty string as a number")
+
+    # Handle common formatting in numeric datasets.
+    text = text.replace(",", "")
+    text = text.replace("−", "-")  # unicode minus
+    text = text.replace("°", "")
+
+    return float(text)
+
+
 def join(rows, transformation, matching_type):
     # return [("", "")], [{'inp': "inp", 'gen': "res", 'exp': "out"}]
 
@@ -267,21 +340,30 @@ def join(rows, transformation, matching_type):
         elif matching_type == 'exact':
             res = val if val in targets else None
             pred = val
-            
+
         elif matching_type == "num_dist":
             min_dist = float("inf")
             min_key = None
-            for target in targets:
-                # val = "" if val is None else val
-                try:
-                    dist = abs(float(target) - val)
+            pred = raw_val
+
+            try:
+                val_num = parse_numeric_value(val)
+            except (TypeError, ValueError, OverflowError):
+                val_num = None
+
+            if val_num is not None:
+                for target in targets:
+                    try:
+                        target_num = parse_numeric_value(target)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+
+                    dist = abs(target_num - val_num)
                     if dist < min_dist:
                         min_dist = dist
                         min_key = target
-                except ValueError:
-                    dist = float("inf")
 
-            res, pred = str(min_key), str(val)
+            res = str(min_key) if min_key is not None else None
 
         else:
             raise Exception("Wrong matching type.")
@@ -295,7 +377,6 @@ def join(rows, transformation, matching_type):
 
 
     return joins, predicts
-
 
 def preprocess(table, pipline):
     test = [(src, tar, src) for src, tar in table['test']]
@@ -323,6 +404,23 @@ def main():
     if os.path.exists(OUTPUT_DIR):
         shutil.rmtree(OUTPUT_DIR)
     pathlib.Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+    if EXAMPLE_SIZE_TYPE == "fixed":
+        print(
+            f"[TabulaX config] example sampling: "
+            f"fixed count={EXAMPLE_SIZE}"
+        )
+    else:
+        print(
+            f"[TabulaX config] example sampling: "
+            f"ceil({EXAMPLE_FRACTION} * gt_size), minimum 1"
+        )
+
+    print(
+        f"[TabulaX config] example seed: "
+        f"{os.getenv('TABULAX_EXAMPLE_SEED', '12345')}"
+    )
+
     configure_llm_logging(
         OUTPUT_DIR,
         dataset=pathlib.Path(DS_PATH).name,

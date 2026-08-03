@@ -192,6 +192,143 @@ def _save_json_cache(labels_dict: dict) -> None:
         json.dump(labels_dict, f, indent=2, ensure_ascii=False)
 
 
+def _canonical_class_label(value: str | None) -> str | None:
+    """
+    Return the canonical TabulaX class name when value contains exactly one
+    class label, ignoring capitalization and common formatting.
+    """
+    if value is None:
+        return None
+
+    cleaned = str(value).strip()
+    cleaned = re.sub(
+        r"^class(?:ification)?\s*:\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = cleaned.strip(" \t\r\n`*_.,:;!?()[]{}\"'")
+
+    for allowed_class in ALLOWED_CLASSES:
+        if cleaned.casefold() == allowed_class.casefold():
+            return allowed_class
+
+    return None
+
+
+def _parse_classifier_response(respond: str) -> str:
+    """
+    Parse either:
+
+        General
+        Class: General
+
+    or GPT-5 responses that classify each example separately:
+
+        ("a" -> "b"): String
+        ("c" -> "d"): General
+        ("e" -> "f"): General
+
+    For per-example classifications, use the unique majority label.
+    """
+    text = str(respond).strip()
+
+    # Preferred case: the complete response is exactly one class.
+    direct_label = _canonical_class_label(text)
+    if direct_label is not None:
+        return direct_label
+
+    class_pattern = "|".join(
+        re.escape(label) for label in ALLOWED_CLASSES
+    )
+
+    # Prefer an explicit dataset-level or overall classification when present.
+    overall_patterns = [
+        rf"(?im)^\s*(?:overall\s+)?class(?:ification)?\s*:\s*"
+        rf"({class_pattern})\s*[.!`*_]*\s*$",
+        rf"(?im)^\s*overall\s*:\s*"
+        rf"({class_pattern})\s*[.!`*_]*\s*$",
+    ]
+
+    for pattern in overall_patterns:
+        match = re.search(pattern, text)
+        if match:
+            label = _canonical_class_label(match.group(1))
+            if label is not None:
+                return label
+
+    # Handle one label per example, such as:
+    # ("source" -> "target"): General
+    extracted_labels = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        line_label = _canonical_class_label(line)
+        if line_label is not None:
+            extracted_labels.append(line_label)
+            continue
+
+        match = re.search(
+            rf":\s*({class_pattern})\s*[.!`*_]*\s*$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            label = _canonical_class_label(match.group(1))
+            if label is not None:
+                extracted_labels.append(label)
+
+    if extracted_labels:
+        counts = {
+            label: extracted_labels.count(label)
+            for label in ALLOWED_CLASSES
+            if label in extracted_labels
+        }
+
+        highest_count = max(counts.values())
+        winners = [
+            label
+            for label, count in counts.items()
+            if count == highest_count
+        ]
+
+        if len(winners) == 1:
+            prediction = winners[0]
+            print(
+                "[TabulaX classifier] Parsed per-example labels "
+                f"{counts}; using majority class {prediction}"
+            )
+            return prediction
+
+        raise ValueError(
+            "Classifier returned tied per-example class labels: "
+            f"{counts}; full response={respond!r}"
+        )
+
+    # Last fallback: accept a class when it is the only allowed class
+    # mentioned anywhere in the response.
+    mentioned_labels = [
+        label
+        for label in ALLOWED_CLASSES
+        if re.search(
+            rf"\b{re.escape(label)}\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    ]
+
+    if len(mentioned_labels) == 1:
+        return mentioned_labels[0]
+
+    raise ValueError(
+        "Could not extract one valid classifier label from "
+        f"response={respond!r}"
+    )
+
+
 def _predict_class_from_examples(
     examples,
     model_name: str | None = None,
@@ -312,11 +449,7 @@ def _predict_class_from_examples(
             "For GPT-5-mini, increase OPENROUTER_MAX_TOKENS or lower reasoning effort."
         )
 
-    out = re.split(r"\s+", respond.replace("Class:", "").strip())[0]
-    if out in ALLOWED_CLASSES:
-        return out
-
-    raise ValueError(f"Invalid classifier output: {out!r}; full response={respond!r}")
+    return _parse_classifier_response(respond)
 
 
 def get_gpt_label(
