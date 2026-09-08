@@ -1,4 +1,5 @@
 import ast
+import csv
 import math
 import os
 import pathlib
@@ -6,6 +7,7 @@ import pickle
 import pprint
 import shutil
 import re
+import sys
 import time
 import nltk
 
@@ -399,6 +401,285 @@ def preprocess(table, pipline):
     }, details
 
 
+# ---------------------------------------------------------------------------
+# Standardized prediction output (output-boundary only).
+#
+# Shared schema (see AutomaticFuzzyJoin/scripts/run_vida_autofj.py and
+# lotus/scripts/run_sem_sim_join.py FAMILY_LAYOUTS):
+#
+#   target_id,target_value,source_id,source_value,score,score_type
+#
+# Canonical VIDA raw orientation per family:
+#   autofj / autofj_overlap: target table = left.csv, source table = right.csv
+#   kbwt / ss / wt:          target table = target.csv, source table = source.csv
+#
+# TabulaX internally transforms the ground-truth first column (its input side)
+# into the ground-truth second column (its output side). For kbwt/ss/wt those
+# raw sides are source.csv / target.csv, already aligned with the canonical
+# orientation. For autofj/autofj_overlap the raw input side is left.csv (the
+# canonical target) and the output side is right.csv (the canonical source),
+# so this adapter swaps the roles at the output boundary only.
+#
+# For each matched prediction row:
+#   * gen is the target-side value TabulaX actually selected (edit_dist, exact,
+#     num_dist). exp is ground truth and is never used here.
+#   * the raw input-side value is the third element of the corresponding
+#     processed test row, which preserves the original raw string for every
+#     class (String/Algorithmic, General bridge, Numbers).
+#
+# IDs come from exact raw-string matching against the raw tables only. GT is
+# never consulted. Duplicate raw join values yield a blank ID.
+# ---------------------------------------------------------------------------
+
+STANDARDIZED_PREDICTION_HEADER = [
+    "target_id",
+    "target_value",
+    "source_id",
+    "source_value",
+    "score",
+    "score_type",
+]
+
+STANDARDIZED_FAMILIES = frozenset(
+    {"autofj", "autofj_overlap", "kbwt", "ss", "wt"}
+)
+
+# Canonical raw files per family: (target table filename, source table filename).
+_FAMILY_RAW_FILES = {
+    "autofj": ("left.csv", "right.csv"),
+    "autofj_overlap": ("left.csv", "right.csv"),
+    "kbwt": ("target.csv", "source.csv"),
+    "ss": ("target.csv", "source.csv"),
+    "wt": ("target.csv", "source.csv"),
+}
+
+
+def _strip_header_names(headers):
+    return [str(header).strip() for header in headers]
+
+
+def _find_column(headers, name):
+    """Case-insensitive lookup of a raw CSV column name (returns the stripped
+    header as stored, or None)."""
+    if name is None:
+        return None
+    folded = {header.casefold(): header for header in _strip_header_names(headers)}
+    return folded.get(str(name).strip().casefold())
+
+
+def _read_rows_txt_columns(table_dir):
+    """Read the canonical ``<source_col>:<target_col>`` mapping from rows.txt.
+
+    The tokens are the column names of the TabulaX input (source) side and the
+    output (target) side; they match the corresponding raw table headers.
+    """
+    rows_path = table_dir / "rows.txt"
+    try:
+        lines = rows_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None, None
+    for line in lines:
+        line = line.strip()
+        if line and ":" in line:
+            src_col, tgt_col = line.split(":", 1)
+            return src_col.strip(), tgt_col.strip()
+    return None, None
+
+
+def _load_raw_join_table(table_dir, filename, rows_txt_column):
+    """Return ``(join_column, [(row_id, raw_value), ...])`` or ``(None, None)``.
+
+    Values are preserved exactly as stored (no stripping, no type coercion),
+    using a plain CSV reader with ``utf-8-sig`` so BOMs, quoted commas and
+    leading-zero text survive. ``row_id`` is the stored ``id`` cell when the
+    file has an ``id`` column (AutoFJ family) and the zero-based row index
+    otherwise (kbwt/ss/wt).
+    """
+    path = table_dir / filename
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.reader(handle)
+            headers = [str(header).strip() for header in next(reader)]
+            join_col = _find_column(headers, rows_txt_column)
+            if join_col is None and len(headers) == 1:
+                join_col = headers[0]
+            if join_col is None:
+                return None, None
+            id_col = _find_column(headers, "id")
+            join_index = headers.index(join_col)
+            id_index = headers.index(id_col) if id_col is not None else None
+            rows = []
+            for row_index, record in enumerate(reader):
+                value = record[join_index] if len(record) > join_index else ""
+                if id_index is not None:
+                    row_id = record[id_index] if len(record) > id_index else ""
+                else:
+                    row_id = str(row_index)
+                rows.append((row_id, value))
+            return join_col, rows
+    except Exception:
+        return None, None
+
+
+def _resolve_table_dir_and_family(table, ds_path):
+    """Return ``(table_dir, family)`` or ``(None, None)``.
+
+    Handles both the current single-table ``DS_PATH`` (``<root>/<family>/<table>``
+    containing rows.txt directly) and the multi-table loading structure (``DS_PATH``
+    = family root, each ``table`` a sub-directory holding rows.txt).
+    """
+    ds_path = pathlib.Path(ds_path)
+    if (ds_path / "rows.txt").is_file():
+        table_dir = ds_path
+    else:
+        table_dir = ds_path / table
+    if not (table_dir / "rows.txt").is_file():
+        return None, None
+    family = table_dir.parent.name
+    if family not in STANDARDIZED_FAMILIES:
+        return None, None
+    return table_dir, family
+
+
+def _resolve_standardized_context(table, ds_path):
+    """Resolve the raw lookup data for one table, or None if unavailable."""
+    table_dir, family = _resolve_table_dir_and_family(table, ds_path)
+    if table_dir is None:
+        return None
+
+    target_filename, source_filename = _FAMILY_RAW_FILES[family]
+    input_col, output_col = _read_rows_txt_columns(table_dir)
+
+    # rows.txt is ordered (TabulaX input-side column, output-side column).
+    # Map each canonical side to the raw file that stores it.
+    if family in ("autofj", "autofj_overlap"):
+        # canonical target = left.csv = TabulaX input side.
+        target_join_col, target_rows = _load_raw_join_table(
+            table_dir, target_filename, input_col
+        )
+        source_join_col, source_rows = _load_raw_join_table(
+            table_dir, source_filename, output_col
+        )
+    else:
+        # canonical source = source.csv = TabulaX input side.
+        source_join_col, source_rows = _load_raw_join_table(
+            table_dir, source_filename, input_col
+        )
+        target_join_col, target_rows = _load_raw_join_table(
+            table_dir, target_filename, output_col
+        )
+
+    if target_join_col is None or source_join_col is None:
+        return None
+
+    return {
+        "family": family,
+        "table_dir": table_dir,
+        "target_rows": target_rows,
+        "source_rows": source_rows,
+    }
+
+
+def _lookup_row_id_and_value(rows, key):
+    """Map a raw join value to (id, canonical value).
+
+    Exactly one raw row match -> its stored id/index and raw cell.
+    Zero or multiple matches -> blank id; the caller's value is kept.
+    Never picks a duplicate row arbitrarily and never uses ground truth.
+    """
+    if key is None:
+        key = ""
+    key = str(key)
+    matches = [row for row in rows if row[1] == key]
+    if len(matches) == 1:
+        return matches[0][0], matches[0][1]
+    return "", key
+
+
+def write_standardized_predictions(
+    table,
+    eval_matching_type,
+    test_rows,
+    predicts,
+    ds_path,
+    output_dir,
+):
+    """Write ``<table>_<eval_matching_type>_predictions.csv`` (additive).
+
+    Emits one row per matched prediction (``gen`` is not None); ``gen`` is the
+    target-side value selected by TabulaX for edit_dist/exact/num_dist. Rows
+    with no match (``gen=None``) are not emitted, and wrong matches with a
+    non-null ``gen`` are kept. ``score`` and ``score_type`` are blank.
+
+    Returns the number of prediction rows written (0 if skipped).
+    """
+    context = _resolve_standardized_context(table, ds_path)
+    if context is None:
+        table_dir, family = _resolve_table_dir_and_family(table, ds_path)
+        if family is not None:
+            print(
+                f"[TabulaX standardized] could not resolve the raw join context "
+                f"for {family}/{table}; skipping "
+                f"{table}_{eval_matching_type}_predictions.csv",
+                file=sys.stderr,
+            )
+        return 0
+
+    family = context["family"]
+    rows = []
+    for predict, test_row in zip(predicts, test_rows):
+        gen = predict.get("gen")
+        if gen is None:
+            continue
+
+        raw_input = test_row[2] if len(test_row) >= 3 else predict.get("inp")
+        if raw_input is None:
+            raw_input = ""
+        gen = str(gen)
+
+        if family in ("autofj", "autofj_overlap"):
+            # target = left.csv (TabulaX input side); source = right.csv (gen side).
+            target_id, target_value = _lookup_row_id_and_value(
+                context["target_rows"], raw_input
+            )
+            source_id, source_value = _lookup_row_id_and_value(
+                context["source_rows"], gen
+            )
+        else:
+            # source = source.csv (TabulaX input side); target = target.csv (gen side).
+            source_id, source_value = _lookup_row_id_and_value(
+                context["source_rows"], raw_input
+            )
+            target_id, target_value = _lookup_row_id_and_value(
+                context["target_rows"], gen
+            )
+
+        rows.append(
+            [target_id, target_value, source_id, source_value, "", ""]
+        )
+
+    output_path = pathlib.Path(output_dir) / (
+        f"{table}_{eval_matching_type}_predictions.csv"
+    )
+    try:
+        with open(output_path, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(STANDARDIZED_PREDICTION_HEADER)
+            writer.writerows(rows)
+    except Exception as exc:
+        print(
+            f"[TabulaX standardized] could not write {output_path.name}: {exc!r}",
+            file=sys.stderr,
+        )
+        return 0
+
+    print(
+        f"[TabulaX standardized] wrote {len(rows)} prediction row(s) to "
+        f"{output_path.name}"
+    )
+    return len(rows)
+
+
 
 def main():
     if os.path.exists(OUTPUT_DIR):
@@ -515,6 +796,16 @@ def main():
                 joins, predicts = join(test, funcs[0], eval_matching_type)
             else:
                 joins, predicts = [], []
+
+            # Standardized prediction CSV (additive output-boundary writer).
+            write_standardized_predictions(
+                table,
+                eval_matching_type,
+                test,
+                predicts,
+                DS_PATH,
+                OUTPUT_DIR,
+            )
 
             avg_edit_dist = sum(
                 edit_distance_func(p['pred'], p['exp']) for p in predicts
